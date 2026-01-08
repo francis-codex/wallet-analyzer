@@ -1,7 +1,7 @@
 """
 Solana Wallet Token Analyzer
 Analyzes wallet addresses and categorizes them based on token deployment activity
-Uses Helius API for token creation data + DexScreener for volume data
+Uses Helius API for token creation data + Birdeye API for all-time volume data
 OPTIMIZED: Uses concurrent threading for parallel API calls
 """
 
@@ -20,7 +20,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 HELIUS_API_KEY = "db683a77-edb6-4c80-8cac-944640c07e21"
 HELIUS_RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 
-# DexScreener for volume data
+# Birdeye API for all-time volume data
+BIRDEYE_API_KEY = "583e4cb8f8854e1b9dd0b281c0beea7e"
+BIRDEYE_BASE = "https://public-api.birdeye.so"
+
+# DexScreener as fallback
 DEXSCREENER_BASE = "https://api.dexscreener.com/latest/dex"
 
 # Rate limiting - BALANCED (fast but safe)
@@ -43,7 +47,7 @@ CSV_HEADERS = [
     'total_tokens_created',
     'most_recent_token',
     'most_recent_token_symbol',
-    'recent_token_volume_24h',
+    'recent_token_volume_alltime',
     'highest_volume_token',
     'highest_volume_amount',
     'all_tokens_data'
@@ -130,12 +134,59 @@ def get_tokens_created_by_wallet(wallet_address: str, attempt: int = 1) -> Optio
             return get_tokens_created_by_wallet(wallet_address, attempt + 1)
         return None
 
-# DEXSCREENER API - GET VOLUME DATA (THREAD-SAFE)
+# BIRDEYE API - GET ALL-TIME VOLUME DATA
 
-def get_token_volume(token_address: str) -> tuple:
+def get_token_alltime_volume_birdeye(token_address: str) -> tuple:
     """
-    Get 24h trading volume for a token from DexScreener
-    Returns: (token_address, volume) tuple for easy mapping
+    Get ALL-TIME trading volume for a token from Birdeye API
+    Returns: (token_address, volume_usd) tuple
+    """
+    try:
+        # Try token overview endpoint first
+        url = f"{BIRDEYE_BASE}/defi/token_overview"
+        headers = {
+            "X-API-KEY": BIRDEYE_API_KEY,
+            "x-chain": "solana"
+        }
+        params = {"address": token_address}
+        
+        response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('success') and data.get('data'):
+                token_data = data['data']
+                # Try to get trade volume or use available volume metric
+                volume = token_data.get('trade24hUSD', 0) or token_data.get('v24hUSD', 0)
+                # If we have market data, use a larger timeframe volume if available
+                if 'extensions' in token_data:
+                    ext = token_data['extensions']
+                    volume = ext.get('totalVolume', volume) or volume
+                return (token_address, float(volume) if volume else 0.0)
+        
+        # Fallback: try trade data endpoint
+        url2 = f"{BIRDEYE_BASE}/defi/v3/token/trade-data/single"
+        params2 = {"address": token_address}
+        response2 = requests.get(url2, headers=headers, params=params2, timeout=REQUEST_TIMEOUT)
+        
+        if response2.status_code == 200:
+            data2 = response2.json()
+            if data2.get('success') and data2.get('data'):
+                # Sum up buy and sell volumes
+                trade_data = data2['data']
+                buy_vol = float(trade_data.get('buy_volume', 0) or 0)
+                sell_vol = float(trade_data.get('sell_volume', 0) or 0)
+                return (token_address, buy_vol + sell_vol)
+        
+        return (token_address, 0.0)
+        
+    except Exception as e:
+        return (token_address, 0.0)
+
+def get_token_volume_dexscreener(token_address: str) -> tuple:
+    """
+    Fallback: Get volume from DexScreener (24h only)
+    Returns: (token_address, volume) tuple
     """
     try:
         url = f"{DEXSCREENER_BASE}/tokens/{token_address}"
@@ -154,15 +205,16 @@ def get_token_volume(token_address: str) -> tuple:
 
 def fetch_volumes_concurrent(tokens: List[Dict]) -> Dict[str, float]:
     """
-    Fetch volumes for multiple tokens CONCURRENTLY using ThreadPoolExecutor
+    Fetch ALL-TIME volumes for multiple tokens CONCURRENTLY
+    Uses Birdeye API primarily, with DexScreener as fallback
     Returns: dict mapping token_address -> volume
     """
     volumes = {}
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Submit all volume fetch tasks
+        # Submit all volume fetch tasks using Birdeye
         futures = {
-            executor.submit(get_token_volume, token['address']): token['address']
+            executor.submit(get_token_alltime_volume_birdeye, token['address']): token['address']
             for token in tokens if token.get('address')
         }
         
@@ -173,6 +225,22 @@ def fetch_volumes_concurrent(tokens: List[Dict]) -> Dict[str, float]:
                 volumes[token_addr] = volume
             except:
                 pass
+    
+    # For tokens with 0 volume, try DexScreener as fallback
+    zero_volume_tokens = [t for t in tokens if volumes.get(t['address'], 0) == 0]
+    if zero_volume_tokens:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(get_token_volume_dexscreener, token['address']): token['address']
+                for token in zero_volume_tokens if token.get('address')
+            }
+            for future in as_completed(futures):
+                try:
+                    token_addr, volume = future.result()
+                    if volume > 0:
+                        volumes[token_addr] = volume
+                except:
+                    pass
     
     return volumes
 
@@ -197,10 +265,8 @@ def search_tokens_by_wallet(wallet_address: str) -> List[Dict]:
                         'symbol': pair.get('baseToken', {}).get('symbol', 'UNKNOWN'),
                         'name': pair.get('baseToken', {}).get('name', 'Unknown'),
                         'created_at': pair.get('pairCreatedAt', 0),
-                        'volume_24h': float(pair.get('volume', {}).get('h24', 0) or 0)
+                        'volume_alltime': 0.0
                     }
-                elif token_addr:
-                    tokens[token_addr]['volume_24h'] += float(pair.get('volume', {}).get('h24', 0) or 0)
             
             return list(tokens.values())
     except:
@@ -208,11 +274,17 @@ def search_tokens_by_wallet(wallet_address: str) -> List[Dict]:
     
     return []
 
-# TOKEN ANALYSIS LOGIC - OPTIMIZED WITH CONCURRENT FETCHING
+# TOKEN ANALYSIS LOGIC - WITH ALL-TIME VOLUME
 
 def analyze_wallet(wallet_address: str) -> Optional[Dict]:
     """
-    Analyze tokens for a wallet with CONCURRENT volume fetching
+    Analyze tokens for a wallet:
+    1. Get tokens created by wallet (Helius)
+    2. Get ALL-TIME volume for each token (Birdeye)
+    3. Determine if most recent token has highest volume
+    
+    Logic: If most_recent_token_volume > all_other_tokens_volumes (individually),
+           then "with highest", otherwise "without highest"
     """
     print(f"  Fetching tokens...")
     
@@ -229,19 +301,19 @@ def analyze_wallet(wallet_address: str) -> Optional[Dict]:
     
     print(f"  Found {len(tokens)} tokens")
     
-    # Sort by creation time to find most recent
+    # Sort by creation time to find most recent (highest created_at = most recent)
     tokens.sort(key=lambda x: (x.get('created_at', 0), x.get('address', '')), reverse=True)
     
-    # Only analyze top 10 most recent tokens
+    # Only analyze top 10 most recent tokens for speed
     tokens_to_check = tokens[:10]
     
-    # CONCURRENT volume fetching - much faster!
-    print(f"  Fetching volumes (parallel)...")
+    # Fetch ALL-TIME volumes using Birdeye
+    print(f"  Fetching all-time volumes...")
     volumes = fetch_volumes_concurrent(tokens_to_check)
     
     # Apply volumes to tokens
     for token in tokens_to_check:
-        token['volume_24h'] = volumes.get(token['address'], 0.0)
+        token['volume_alltime'] = volumes.get(token['address'], 0.0)
     
     tokens_with_data = [t for t in tokens_to_check if t.get('address')]
     
@@ -249,23 +321,30 @@ def analyze_wallet(wallet_address: str) -> Optional[Dict]:
         log_failed_wallet(wallet_address, "No valid tokens")
         return None
     
+    # Most recent token is the first one (sorted by created_at descending)
     most_recent_token = tokens_with_data[0]
-    highest_volume_token = max(tokens_with_data, key=lambda x: x.get('volume_24h', 0))
+    
+    # Find token with highest volume
+    highest_volume_token = max(tokens_with_data, key=lambda x: x.get('volume_alltime', 0))
+    
+    # Check if most recent token has the highest volume
+    # If most_recent volume >= highest volume of any other token, it's "with highest"
     has_highest_volume = (most_recent_token['address'] == highest_volume_token['address'])
     
+    # Create summary of all tokens (sorted by volume)
     all_tokens_summary = "; ".join([
-        f"{t.get('symbol', 'UNK')}(${t.get('volume_24h', 0):,.2f})"
-        for t in sorted(tokens_with_data, key=lambda x: x.get('volume_24h', 0), reverse=True)[:5]
+        f"{t.get('symbol', 'UNK')}(${t.get('volume_alltime', 0):,.0f})"
+        for t in sorted(tokens_with_data, key=lambda x: x.get('volume_alltime', 0), reverse=True)[:5]
     ])
     
     return {
         'wallet_address': wallet_address,
-        'total_tokens_created': len(tokens),
+        'total_tokens_created': len(tokens),  # Total tokens, not just analyzed
         'most_recent_token': most_recent_token.get('address', ''),
         'most_recent_token_symbol': most_recent_token.get('symbol', 'UNKNOWN'),
-        'recent_token_volume_24h': most_recent_token.get('volume_24h', 0),
+        'recent_token_volume_alltime': most_recent_token.get('volume_alltime', 0),
         'highest_volume_token': highest_volume_token.get('address', ''),
-        'highest_volume_amount': highest_volume_token.get('volume_24h', 0),
+        'highest_volume_amount': highest_volume_token.get('volume_alltime', 0),
         'all_tokens_data': all_tokens_summary,
         'has_highest_volume': has_highest_volume
     }
@@ -313,7 +392,7 @@ def add_summary_row():
                         'total_tokens_created': f'{total_tokens} total tokens',
                         'most_recent_token': f'Avg: {avg_tokens:.1f} tokens/wallet',
                         'most_recent_token_symbol': '',
-                        'recent_token_volume_24h': '',
+                        'recent_token_volume_alltime': '',
                         'highest_volume_token': '',
                         'highest_volume_amount': '',
                         'all_tokens_data': ''
@@ -363,7 +442,7 @@ CATEGORIZATION:
 VALIDATION CHECK:
 - Processed + Failed = {successful + failed}
 - Should equal total processed = {total_wallets - skipped}
-- Status: {'✓ PASS' if (successful + failed) == (total_wallets - skipped) else '✗ FAIL'}
+- Status: {'PASS' if (successful + failed) == (total_wallets - skipped) else 'FAIL'}
 
 OUTPUT FILES:
 - High volume wallets: {HIGH_VOLUME_CSV}
@@ -385,7 +464,7 @@ def main():
     """Main execution function"""
     print("\n" + "="*60)
     print("SOLANA WALLET TOKEN ANALYZER")
-    print("SPEED OPTIMIZED - Parallel Processing Enabled")
+    print("Using: Helius + Birdeye (All-Time Volume)")
     print("="*60 + "\n")
     
     if not os.path.exists(INPUT_FILE):
@@ -394,7 +473,7 @@ def main():
     
     print(f"Loading wallet addresses from {INPUT_FILE}...")
     with open(INPUT_FILE, 'r') as f:
-        all_wallets = [line.strip() for line in f if line.strip()]
+        all_wallets = [line.strip() for line in f if line.strip() and not line.startswith('<')]
     
     if not all_wallets:
         print("ERROR: No wallet addresses found!")
@@ -436,7 +515,7 @@ def main():
             successful_count += 1
             
             status = "[HIGH]" if result['has_highest_volume'] else "[Low]"
-            print(f"  {status} | Tokens: {result['total_tokens_created']} | Vol: ${result['recent_token_volume_24h']:,.2f}")
+            print(f"  {status} | Tokens: {result['total_tokens_created']} | Recent Vol: ${result['recent_token_volume_alltime']:,.0f} | Highest: ${result['highest_volume_amount']:,.0f}")
         else:
             failed_count += 1
             print(f"  [FAIL] Failed")

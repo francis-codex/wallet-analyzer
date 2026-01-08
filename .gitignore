@@ -1,0 +1,8 @@
+*.csv
+*.log
+summary_report.txt
+venv/
+dist/
+build/
+*.spec
+__pycache__/
