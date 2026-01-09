@@ -40,6 +40,7 @@ FAILED_LOG = "failed_wallets.log"
 HIGH_VOLUME_CSV = "wallets_with_highest_recent_volume.csv"
 LOW_VOLUME_CSV = "wallets_without_highest_recent_volume.csv"
 SUMMARY_FILE = "summary_report.txt"
+VOLUME_DEBUG_LOG = "volume_debug.log"  # NEW: Diagnostic log for volume issues
 
 # CSV Headers
 CSV_HEADERS = [
@@ -134,15 +135,22 @@ def get_tokens_created_by_wallet(wallet_address: str, attempt: int = 1) -> Optio
             return get_tokens_created_by_wallet(wallet_address, attempt + 1)
         return None
 
-# BIRDEYE API - GET ALL-TIME VOLUME DATA
+# BIRDEYE API - GET 24H VOLUME DATA (with diagnostic logging)
 
-def get_token_alltime_volume_birdeye(token_address: str) -> tuple:
+def log_volume_debug(message: str):
+    """Write diagnostic message to volume debug log"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(VOLUME_DEBUG_LOG, 'a') as f:
+        f.write(f"[{timestamp}] {message}\n")
+
+def get_token_volume_birdeye(token_address: str) -> tuple:
     """
-    Get ALL-TIME trading volume for a token from Birdeye API
-    Returns: (token_address, volume_usd) tuple
+    Get 24-hour trading volume for a token from Birdeye API
+    Returns: (token_address, volume_usd, status) tuple
+    Status: 'success', 'rate_limited', 'not_found', 'error'
     """
     try:
-        # Try token overview endpoint first
+        # Primary endpoint: token overview
         url = f"{BIRDEYE_BASE}/defi/token_overview"
         headers = {
             "X-API-KEY": BIRDEYE_API_KEY,
@@ -152,36 +160,69 @@ def get_token_alltime_volume_birdeye(token_address: str) -> tuple:
         
         response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
         
+        # Handle rate limiting
+        if response.status_code == 429:
+            log_volume_debug(f"RATE_LIMITED: {token_address[:8]}... - token_overview endpoint")
+            return (token_address, 0.0, 'rate_limited')
+        
         if response.status_code == 200:
             data = response.json()
             if data.get('success') and data.get('data'):
                 token_data = data['data']
-                # Try to get trade volume or use available volume metric
-                volume = token_data.get('trade24hUSD', 0) or token_data.get('v24hUSD', 0)
-                # If we have market data, use a larger timeframe volume if available
-                if 'extensions' in token_data:
-                    ext = token_data['extensions']
-                    volume = ext.get('totalVolume', volume) or volume
-                return (token_address, float(volume) if volume else 0.0)
+                symbol = token_data.get('symbol', 'UNKNOWN')
+                
+                # Get 24h volume (v24hUSD is the correct field)
+                volume = token_data.get('v24hUSD', 0) or 0
+                
+                # Log what we found
+                if volume and volume > 0:
+                    log_volume_debug(f"SUCCESS: {symbol} ({token_address[:8]}...) -> ${volume:,.2f}")
+                    return (token_address, float(volume), 'success')
+                else:
+                    log_volume_debug(f"ZERO_VOLUME: {symbol} ({token_address[:8]}...) - v24hUSD was {token_data.get('v24hUSD')}")
+            else:
+                log_volume_debug(f"NO_DATA: {token_address[:8]}... - API success=False or no data field")
+        elif response.status_code != 429:
+            log_volume_debug(f"HTTP_ERROR: {token_address[:8]}... - Status {response.status_code}")
         
         # Fallback: try trade data endpoint
         url2 = f"{BIRDEYE_BASE}/defi/v3/token/trade-data/single"
         params2 = {"address": token_address}
         response2 = requests.get(url2, headers=headers, params=params2, timeout=REQUEST_TIMEOUT)
         
+        if response2.status_code == 429:
+            log_volume_debug(f"RATE_LIMITED: {token_address[:8]}... - trade-data endpoint")
+            return (token_address, 0.0, 'rate_limited')
+        
         if response2.status_code == 200:
             data2 = response2.json()
             if data2.get('success') and data2.get('data'):
-                # Sum up buy and sell volumes
                 trade_data = data2['data']
-                buy_vol = float(trade_data.get('buy_volume', 0) or 0)
-                sell_vol = float(trade_data.get('sell_volume', 0) or 0)
-                return (token_address, buy_vol + sell_vol)
+                # Correct field names for this endpoint
+                volume_24h = trade_data.get('volume_24h_usd', 0) or 0
+                
+                if volume_24h and volume_24h > 0:
+                    log_volume_debug(f"SUCCESS_FALLBACK: {token_address[:8]}... -> ${volume_24h:,.2f} (via trade-data)")
+                    return (token_address, float(volume_24h), 'success')
+                else:
+                    log_volume_debug(f"ZERO_VOLUME_FALLBACK: {token_address[:8]}... - volume_24h_usd was {trade_data.get('volume_24h_usd')}")
         
-        return (token_address, 0.0)
+        log_volume_debug(f"NOT_FOUND: {token_address[:8]}... - Both endpoints returned no volume")
+        return (token_address, 0.0, 'not_found')
         
+    except requests.exceptions.Timeout:
+        log_volume_debug(f"TIMEOUT: {token_address[:8]}...")
+        return (token_address, 0.0, 'error')
     except Exception as e:
-        return (token_address, 0.0)
+        log_volume_debug(f"EXCEPTION: {token_address[:8]}... - {str(e)}")
+        return (token_address, 0.0, 'error')
+
+# Keep old function name for compatibility
+def get_token_alltime_volume_birdeye(token_address: str) -> tuple:
+    """Wrapper for backwards compatibility - now returns 24h volume"""
+    addr, vol, status = get_token_volume_birdeye(token_address)
+    return (addr, vol)
+
 
 def get_token_volume_dexscreener(token_address: str) -> tuple:
     """
@@ -280,7 +321,7 @@ def analyze_wallet(wallet_address: str) -> Optional[Dict]:
     """
     Analyze tokens for a wallet:
     1. Get tokens created by wallet (Helius)
-    2. Get ALL-TIME volume for each token (Birdeye)
+    2. Get 24h volume for each token (Birdeye)
     3. Determine if most recent token has highest volume
     
     Logic: If most_recent_token_volume > all_other_tokens_volumes (individually),
@@ -307,8 +348,8 @@ def analyze_wallet(wallet_address: str) -> Optional[Dict]:
     # Only analyze top 10 most recent tokens for speed
     tokens_to_check = tokens[:10]
     
-    # Fetch ALL-TIME volumes using Birdeye
-    print(f"  Fetching all-time volumes...")
+    # Fetch 24h volumes using Birdeye
+    print(f"  Fetching 24h volumes...")
     volumes = fetch_volumes_concurrent(tokens_to_check)
     
     # Apply volumes to tokens
@@ -464,8 +505,15 @@ def main():
     """Main execution function"""
     print("\n" + "="*60)
     print("SOLANA WALLET TOKEN ANALYZER")
-    print("Using: Helius + Birdeye (All-Time Volume)")
+    print("Using: Helius + Birdeye (24h Volume)")
     print("="*60 + "\n")
+    
+    # Initialize debug log for this run
+    with open(VOLUME_DEBUG_LOG, 'w') as f:
+        f.write(f"=== Volume Fetch Debug Log ===\n")
+        f.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"{'='*40}\n\n")
+    print(f"Debug logging enabled: {VOLUME_DEBUG_LOG}")
     
     if not os.path.exists(INPUT_FILE):
         print(f"ERROR: Input file '{INPUT_FILE}' not found!")
