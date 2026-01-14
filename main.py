@@ -1,8 +1,8 @@
 """
 Solana Wallet Token Analyzer
 Analyzes wallet addresses and categorizes them based on token deployment activity
-Uses Helius API for token creation data + Birdeye API for all-time volume data
-OPTIMIZED: Uses concurrent threading for parallel API calls
+Uses Helius API for token creation data + Bitquery API for all-time volume data
+OPTIMIZED: Uses sequential requests with rate limiting for Bitquery
 """
 
 import requests
@@ -20,18 +20,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 HELIUS_API_KEY = "db683a77-edb6-4c80-8cac-944640c07e21"
 HELIUS_RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 
-# Birdeye API for all-time volume data
+# Birdeye API (fallback for 24h data)
 BIRDEYE_API_KEY = "583e4cb8f8854e1b9dd0b281c0beea7e"
 BIRDEYE_BASE = "https://public-api.birdeye.so"
+
+# Bitquery API for ALL-TIME volume data (primary source)
+BITQUERY_API_KEY = "ory_at_f69h1vIyqfoZCMQBZHilDNqYO6jAXQuZXqmkMGfJqhU.YR3ogtPpi1ouRZkMkLCx8pLRHFr5QkIq0Q8yhGxDSZs"
+BITQUERY_URL = "https://streaming.bitquery.io/graphql"
 
 # DexScreener as fallback
 DEXSCREENER_BASE = "https://api.dexscreener.com/latest/dex"
 
-# Rate limiting - BALANCED (fast but safe)
-RATE_LIMIT_DELAY = 0.15  # seconds between wallets
+# Rate limiting - CONSERVATIVE for Bitquery (10 req/min limit)
+RATE_LIMIT_DELAY = 0.5  # seconds between wallets
 MAX_RETRIES = 3  # retry on rate limits
-REQUEST_TIMEOUT = 12  # reasonable timeout
-MAX_WORKERS = 12  # good parallelism
+REQUEST_TIMEOUT = 30  # longer timeout for GraphQL
+MAX_WORKERS = 3  # reduced to stay under rate limits
+BITQUERY_DELAY = 7  # seconds between Bitquery requests (10 req/min = 6s min)
 
 # File paths
 INPUT_FILE = "wallets.txt"
@@ -135,13 +140,112 @@ def get_tokens_created_by_wallet(wallet_address: str, attempt: int = 1) -> Optio
             return get_tokens_created_by_wallet(wallet_address, attempt + 1)
         return None
 
-# BIRDEYE API - GET 24H VOLUME DATA (with diagnostic logging)
+# BITQUERY API - GET ALL-TIME VOLUME DATA (PRIMARY SOURCE)
+
+# Track last Bitquery request time for rate limiting
+_last_bitquery_request = 0
+
+def get_token_volume_bitquery(token_address: str) -> tuple:
+    """
+    Get ALL-TIME trading volume for a token from Bitquery GraphQL API
+    Returns: (token_address, volume_usd, status) tuple
+    Status: 'success', 'rate_limited', 'not_found', 'error'
+    """
+    global _last_bitquery_request
+    
+    try:
+        # Respect rate limiting (10 req/min for free tier)
+        elapsed = time.time() - _last_bitquery_request
+        if elapsed < BITQUERY_DELAY:
+            time.sleep(BITQUERY_DELAY - elapsed)
+        
+        # GraphQL query for aggregated volume across all pools
+        query = """
+        {
+            Solana(dataset: archive) {
+                DEXTradeByTokens(
+                    where: {Trade: {Currency: {MintAddress: {is: "%s"}}}}
+                ) {
+                    Trade {
+                        Currency {
+                            Symbol
+                        }
+                    }
+                    volume: sum(of: Trade_Side_AmountInUSD)
+                }
+            }
+        }
+        """ % token_address
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {BITQUERY_API_KEY}"
+        }
+        
+        _last_bitquery_request = time.time()
+        response = requests.post(
+            BITQUERY_URL,
+            json={"query": query},
+            headers=headers,
+            timeout=REQUEST_TIMEOUT
+        )
+        
+        if response.status_code == 429:
+            log_volume_debug(f"BITQUERY_RATE_LIMITED: {token_address[:8]}...")
+            return (token_address, 0.0, 'rate_limited')
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            # Check for errors
+            if data.get('errors'):
+                log_volume_debug(f"BITQUERY_ERROR: {token_address[:8]}... - {data['errors'][0].get('message', 'Unknown error')}")
+                return (token_address, 0.0, 'error')
+            
+            # Sum volumes from all pools/markets
+            trades = data.get('data', {}).get('Solana', {}).get('DEXTradeByTokens', [])
+            
+            if not trades:
+                log_volume_debug(f"BITQUERY_NO_DATA: {token_address[:8]}... - No trades found")
+                return (token_address, 0.0, 'not_found')
+            
+            # Aggregate volume across all pools
+            total_volume = 0.0
+            symbol = "UNKNOWN"
+            for trade in trades:
+                try:
+                    vol = float(trade.get('volume', 0) or 0)
+                    total_volume += vol
+                    if trade.get('Trade', {}).get('Currency', {}).get('Symbol'):
+                        symbol = trade['Trade']['Currency']['Symbol']
+                except (ValueError, TypeError):
+                    continue
+            
+            if total_volume > 0:
+                log_volume_debug(f"BITQUERY_SUCCESS: {symbol} ({token_address[:8]}...) -> ${total_volume:,.2f}")
+                return (token_address, total_volume, 'success')
+            else:
+                log_volume_debug(f"BITQUERY_ZERO: {symbol} ({token_address[:8]}...) - Total volume was 0")
+                return (token_address, 0.0, 'not_found')
+        else:
+            log_volume_debug(f"BITQUERY_HTTP_ERROR: {token_address[:8]}... - Status {response.status_code}")
+            return (token_address, 0.0, 'error')
+            
+    except requests.exceptions.Timeout:
+        log_volume_debug(f"BITQUERY_TIMEOUT: {token_address[:8]}...")
+        return (token_address, 0.0, 'error')
+    except Exception as e:
+        log_volume_debug(f"BITQUERY_EXCEPTION: {token_address[:8]}... - {str(e)}")
+        return (token_address, 0.0, 'error')
+
+# BIRDEYE API - GET 24H VOLUME DATA (FALLBACK - with diagnostic logging)
 
 def log_volume_debug(message: str):
     """Write diagnostic message to volume debug log"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(VOLUME_DEBUG_LOG, 'a') as f:
         f.write(f"[{timestamp}] {message}\n")
+
 
 def get_token_volume_birdeye(token_address: str) -> tuple:
     """
@@ -246,42 +350,46 @@ def get_token_volume_dexscreener(token_address: str) -> tuple:
 
 def fetch_volumes_concurrent(tokens: List[Dict]) -> Dict[str, float]:
     """
-    Fetch ALL-TIME volumes for multiple tokens CONCURRENTLY
-    Uses Birdeye API primarily, with DexScreener as fallback
+    Fetch ALL-TIME volumes for multiple tokens
+    Uses Bitquery API primarily (for all-time volume), with Birdeye as fallback
+    Note: Sequential for Bitquery due to rate limits (10 req/min)
     Returns: dict mapping token_address -> volume
     """
     volumes = {}
     
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Submit all volume fetch tasks using Birdeye
-        futures = {
-            executor.submit(get_token_alltime_volume_birdeye, token['address']): token['address']
-            for token in tokens if token.get('address')
-        }
-        
-        # Collect results as they complete
-        for future in as_completed(futures):
-            try:
-                token_addr, volume = future.result()
-                volumes[token_addr] = volume
-            except:
-                pass
+    print(f"    Fetching volumes for {len(tokens)} tokens via Bitquery...")
     
-    # For tokens with 0 volume, try DexScreener as fallback
-    zero_volume_tokens = [t for t in tokens if volumes.get(t['address'], 0) == 0]
+    # Primary: Use Bitquery for all-time volume (sequential due to rate limits)
+    for i, token in enumerate(tokens):
+        if not token.get('address'):
+            continue
+            
+        token_addr = token['address']
+        addr, volume, status = get_token_volume_bitquery(token_addr)
+        
+        if status == 'success' and volume > 0:
+            volumes[token_addr] = volume
+        
+        # Progress indicator
+        if (i + 1) % 3 == 0:
+            print(f"    Progress: {i + 1}/{len(tokens)} tokens processed")
+    
+    # Fallback: For tokens with 0 volume from Bitquery, try Birdeye (24h)
+    zero_volume_tokens = [t for t in tokens if volumes.get(t['address'], 0) == 0 and t.get('address')]
+    
     if zero_volume_tokens:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(get_token_volume_dexscreener, token['address']): token['address']
-                for token in zero_volume_tokens if token.get('address')
-            }
-            for future in as_completed(futures):
-                try:
-                    token_addr, volume = future.result()
-                    if volume > 0:
-                        volumes[token_addr] = volume
-                except:
-                    pass
+        print(f"    Trying Birdeye fallback for {len(zero_volume_tokens)} tokens...")
+        
+        for token in zero_volume_tokens:
+            token_addr = token['address']
+            addr, volume, status = get_token_volume_birdeye(token_addr)
+            
+            if status == 'success' and volume > 0:
+                volumes[token_addr] = volume
+                log_volume_debug(f"FALLBACK_BIRDEYE: {token_addr[:8]}... -> ${volume:,.2f}")
+            
+            # Small delay to avoid Birdeye rate limits too
+            time.sleep(0.5)
     
     return volumes
 
@@ -348,8 +456,8 @@ def analyze_wallet(wallet_address: str) -> Optional[Dict]:
     # Only analyze top 10 most recent tokens for speed
     tokens_to_check = tokens[:10]
     
-    # Fetch 24h volumes using Birdeye
-    print(f"  Fetching 24h volumes...")
+    # Fetch all-time volumes using Bitquery (with Birdeye fallback)
+    print(f"  Fetching all-time volumes via Bitquery...")
     volumes = fetch_volumes_concurrent(tokens_to_check)
     
     # Apply volumes to tokens
@@ -505,15 +613,16 @@ def main():
     """Main execution function"""
     print("\n" + "="*60)
     print("SOLANA WALLET TOKEN ANALYZER")
-    print("Using: Helius + Birdeye (24h Volume)")
+    print("Using: Helius + Bitquery (All-Time Volume)")
     print("="*60 + "\n")
     
     # Initialize debug log for this run
     with open(VOLUME_DEBUG_LOG, 'w') as f:
-        f.write(f"=== Volume Fetch Debug Log ===\n")
+        f.write(f"=== Volume Fetch Debug Log (Bitquery) ===\n")
         f.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"{'='*40}\n\n")
     print(f"Debug logging enabled: {VOLUME_DEBUG_LOG}")
+    print(f"Note: Using 7-second delay between tokens for rate limiting")
     
     if not os.path.exists(INPUT_FILE):
         print(f"ERROR: Input file '{INPUT_FILE}' not found!")
